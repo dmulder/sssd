@@ -1270,6 +1270,61 @@ int sysdb_enumgrent_with_views(TALLOC_CTX *mem_ctx,
     return sysdb_enumgrent_filter_with_views(mem_ctx, domain, NULL, NULL, _res);
 }
 
+int sysdb_initcomp(TALLOC_CTX *mem_ctx,
+                   struct sss_domain_info *domain,
+                   struct ldb_result **_res)
+{
+    TALLOC_CTX *tmp_ctx;
+    struct ldb_result *res;
+    struct ldb_request *req;
+    static const char *attrs[] = SYSDB_INITCOMP_ATTRS;
+    int ret;
+    char *filter = NULL;
+    char *hostname = NULL;
+
+    tmp_ctx = talloc_new(NULL);
+    if (!tmp_ctx) {
+        return ENOMEM;
+    }
+
+    hostname = talloc_zero_size(tmp_ctx, HOST_NAME_MAX);
+    ret = gethostname(hostname, HOST_NAME_MAX);
+    if (ret != 0) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    filter = talloc_asprintf(tmp_ctx, SYSDB_INITCOMP_FILTER, hostname);
+    if (!filter) {
+        ret = ENOMEM;
+        goto done;
+    }
+    ret = ldb_build_search_req(&req, domain->sysdb->ldb, tmp_ctx,
+                               NULL, LDB_SCOPE_SUBTREE,
+                               filter, attrs, NULL,
+                               res, ldb_search_default_callback,
+                               NULL);
+    if (ret != LDB_SUCCESS) {
+        ret = sysdb_error_to_errno(ret);
+        goto done;
+    }
+
+    ret = ldb_request(domain->sysdb->ldb, req);
+    if (ret == LDB_SUCCESS) {
+        ret = ldb_wait(req->handle, LDB_WAIT_ALL);
+    }
+    if (ret != LDB_SUCCESS) {
+        ret = sysdb_error_to_errno(ret);
+        goto done;
+    }
+
+    *_res = talloc_steal(mem_ctx, res);
+
+done:
+    talloc_zfree(tmp_ctx);
+    return ret;
+}
+
 int sysdb_initgroups(TALLOC_CTX *mem_ctx,
                      struct sss_domain_info *domain,
                      const char *name,

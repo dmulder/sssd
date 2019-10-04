@@ -54,6 +54,7 @@
 #define SYSDB_GROUP_CLASS "group"
 #define SYSDB_NETGROUP_CLASS "netgroup"
 #define SYSDB_HOST_CLASS "host"
+#define SYSDB_COMPUTER_CLASS "computer"
 #define SYSDB_HOSTGROUP_CLASS "hostgroup"
 #define SYSDB_SELINUX_USERMAP_CLASS "selinuxusermap"
 #define SYSDB_SELINUX_CLASS "selinux"
@@ -194,6 +195,7 @@
 
 #define SYSDB_OBJECTCATEGORY "objectCategory"
 #define SYSDB_UC SYSDB_OBJECTCATEGORY"="SYSDB_USER_CLASS
+#define SYSDB_CC SYSDB_OBJECTCATEGORY"="SYSDB_COMPUTER_CLASS
 #define SYSDB_GC SYSDB_OBJECTCATEGORY"="SYSDB_GROUP_CLASS
 #define SYSDB_NC SYSDB_OBJECTCLASS"="SYSDB_NETGROUP_CLASS
 #define SYSDB_MPGC "|("SYSDB_UC")("SYSDB_GC")"
@@ -212,6 +214,7 @@
 #define SYSDB_GRGID_MPG_FILTER "(&("SYSDB_MPGC")("SYSDB_GIDNUM"=%lu))"
 #define SYSDB_GRENT_MPG_FILTER "("SYSDB_MPGC")"
 
+#define SYSDB_INITCOMP_FILTER "(&("SYSDB_CC")("SYSDB_NAME"=%s))"
 #define SYSDB_INITGR_FILTER "(&("SYSDB_GC")("SYSDB_GIDNUM"=*))"
 
 #define SYSDB_NETGR_FILTER "(&("SYSDB_NC")(|("SYSDB_NAME_ALIAS"=%s)("SYSDB_NAME_ALIAS"=%s)("SYSDB_NAME"=%s)))"
@@ -264,6 +267,9 @@
                            SYSDB_NETGROUP_MEMBER, \
                            SYSDB_DEFAULT_ATTRS, \
                            NULL}
+
+#define SYSDB_INITCOMP_ATTRS {SYSDB_SID_STR, \
+                              NULL}
 
 #define SYSDB_INITGR_ATTR SYSDB_MEMBEROF
 #define SYSDB_INITGR_ATTRS {SYSDB_GIDNUM, SYSDB_POSIX, \
@@ -815,6 +821,10 @@ errno_t sysdb_getnetgr(TALLOC_CTX *mem_ctx,
                        struct sss_domain_info *domain,
                        const char *netgroup,
                        struct ldb_result **res);
+
+int sysdb_initcomp(TALLOC_CTX *mem_ctx,
+                   struct sss_domain_info *domain,
+                   struct ldb_result **_res);
 
 int sysdb_initgroups(TALLOC_CTX *mem_ctx,
                      struct sss_domain_info *domain,

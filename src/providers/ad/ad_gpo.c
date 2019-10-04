@@ -553,6 +553,7 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
                 const char *user,
                 struct sss_domain_info *domain,
                 const char **_user_sid,
+                const char **_host_sid,
                 const char ***_group_sids,
                 int *_group_size)
 {
@@ -562,6 +563,7 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
     int i = 0;
     int num_group_sids = 0;
     const char *user_sid = NULL;
+    const char *host_sid = NULL;
     const char *group_sid = NULL;
     const char **group_sids = NULL;
 
@@ -570,6 +572,23 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
         ret = ENOMEM;
         goto done;
     }
+
+    ret = sysdb_initcomp(tmp_ctx, domain, &res);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_initcomp failed: [%d](%s)\n",
+              ret, sss_strerror(ret));
+        goto done;
+    }
+
+    if (res->count != 1) {
+        ret = ENOENT;
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_initcomp returned empty result\n");
+        goto done;
+    }
+
+    host_sid = ldb_msg_find_attr_as_string(res->msgs[0], SYSDB_SID_STR, NULL);
 
     /* first result from sysdb_initgroups is user_sid; rest are group_sids */
     ret = sysdb_initgroups(tmp_ctx, domain, user, &res);
@@ -618,6 +637,7 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
 
     *_group_size = num_group_sids + 1;
     *_group_sids = talloc_steal(mem_ctx, group_sids);
+    *_host_sid = talloc_steal(mem_ctx, host_sid);
     *_user_sid = talloc_steal(mem_ctx, user_sid);
     ret = EOK;
 
@@ -632,6 +652,7 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
  */
 static errno_t
 ad_gpo_ace_includes_client_sid(const char *user_sid,
+                               const char *host_sid,
                                const char **group_sids,
                                int group_size,
                                struct dom_sid ace_dom_sid,
@@ -640,6 +661,7 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
 {
     int i = 0;
     struct dom_sid *user_dom_sid;
+    struct dom_sid *host_dom_sid;
     struct dom_sid *group_dom_sid;
     enum idmap_error_code err;
     bool included = false;
@@ -652,6 +674,19 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
 
     included = ad_gpo_dom_sid_equal(&ace_dom_sid, user_dom_sid);
     sss_idmap_free_smb_sid(idmap_ctx, user_dom_sid);
+    if (included) {
+        *_included = true;
+        return EOK;
+    }
+
+    err = sss_idmap_sid_to_smb_sid(idmap_ctx, host_sid, &host_dom_sid);
+    if (err != IDMAP_SUCCESS) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Failed to initialize idmap context.\n");
+        return EFAULT;
+    }
+
+    included = ad_gpo_dom_sid_equal(&ace_dom_sid, host_dom_sid);
+    sss_idmap_free_smb_sid(idmap_ctx, host_dom_sid);
     if (included) {
         *_included = true;
         return EOK;
@@ -706,6 +741,7 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
 static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
                                                 struct sss_idmap_ctx *idmap_ctx,
                                                 const char *user_sid,
+                                                const char *host_sid,
                                                 const char **group_sids,
                                                 int group_size)
 {
@@ -719,8 +755,9 @@ static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
         return AD_GPO_ACE_NEUTRAL;
     }
 
-    ret = ad_gpo_ace_includes_client_sid(user_sid, group_sids, group_size,
-                                         ace->trustee, idmap_ctx, &included);
+    ret = ad_gpo_ace_includes_client_sid(user_sid, host_sid, group_sids,
+                                         group_size, ace->trustee, idmap_ctx,
+                                         &included);
 
     if (ret != EOK) {
         return AD_GPO_ACE_DENIED;
@@ -764,6 +801,7 @@ static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
 static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
                                     struct sss_idmap_ctx *idmap_ctx,
                                     const char *user_sid,
+                                    const char *host_sid,
                                     const char **group_sids,
                                     int group_size,
                                     bool *_dacl_access_allowed)
@@ -788,7 +826,7 @@ static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
     for (i = 0; i < dacl->num_aces; i ++) {
         ace = &dacl->aces[i];
 
-        ace_status = ad_gpo_evaluate_ace(ace, idmap_ctx, user_sid,
+        ace_status = ad_gpo_evaluate_ace(ace, idmap_ctx, user_sid, host_sid,
                                          group_sids, group_size);
 
         switch (ace_status) {
@@ -830,6 +868,7 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
     struct security_descriptor *sd = NULL;
     struct security_acl *dacl = NULL;
     const char *user_sid = NULL;
+    const char *host_sid = NULL;
     const char **group_sids = NULL;
     int group_size = 0;
     int gpo_dn_idx = 0;
@@ -842,7 +881,7 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    ret = ad_gpo_get_sids(tmp_ctx, user, domain, &user_sid,
+    ret = ad_gpo_get_sids(tmp_ctx, user, domain, &user_sid, &host_sid,
                           &group_sids, &group_size);
     if (ret != EOK) {
         ret = ERR_NO_SIDS;
@@ -905,8 +944,8 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
             break;
         }
 
-        ret = ad_gpo_evaluate_dacl(dacl, idmap_ctx, user_sid, group_sids,
-                                   group_size, &access_allowed);
+        ret = ad_gpo_evaluate_dacl(dacl, idmap_ctx, user_sid, host_sid,
+                                   group_sids, group_size, &access_allowed);
         if (ret != EOK) {
             DEBUG(SSSDBG_MINOR_FAILURE, "Could not determine if GPO is applicable\n");
             continue;
@@ -1340,6 +1379,7 @@ ad_gpo_access_check(TALLOC_CTX *mem_ctx,
                     int denied_size)
 {
     const char *user_sid;
+    const char *host_sid;
     const char **group_sids;
     int group_size = 0;
     bool access_granted = false;
@@ -1360,7 +1400,7 @@ ad_gpo_access_check(TALLOC_CTX *mem_ctx,
         DEBUG(SSSDBG_TRACE_FUNC, " denied_sids[%d] = %s\n", j, denied_sids[j]);
     }
 
-    ret = ad_gpo_get_sids(mem_ctx, user, domain, &user_sid,
+    ret = ad_gpo_get_sids(mem_ctx, user, domain, &user_sid, &host_sid,
                           &group_sids, &group_size);
     if (ret != EOK) {
         ret = ERR_NO_SIDS;
