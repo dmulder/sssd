@@ -65,6 +65,7 @@
 #define AD_AT_MACHINE_EXT_NAMES "gPCMachineExtensionNames"
 #define AD_AT_FUNC_VERSION "gPCFunctionalityVersion"
 #define AD_AT_FLAGS "flags"
+#define AD_AT_SID "objectSid"
 
 #define UAC_WORKSTATION_TRUST_ACCOUNT 0x00001000
 #define UAC_SERVER_TRUST_ACCOUNT 0x00002000
@@ -632,6 +633,7 @@ ad_gpo_get_sids(TALLOC_CTX *mem_ctx,
  */
 static errno_t
 ad_gpo_ace_includes_client_sid(const char *user_sid,
+                               struct dom_sid *host_dom_sid,
                                const char **group_sids,
                                int group_size,
                                struct dom_sid ace_dom_sid,
@@ -652,6 +654,12 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
 
     included = ad_gpo_dom_sid_equal(&ace_dom_sid, user_dom_sid);
     sss_idmap_free_smb_sid(idmap_ctx, user_dom_sid);
+    if (included) {
+        *_included = true;
+        return EOK;
+    }
+
+    included = ad_gpo_dom_sid_equal(&ace_dom_sid, host_dom_sid);
     if (included) {
         *_included = true;
         return EOK;
@@ -706,6 +714,7 @@ ad_gpo_ace_includes_client_sid(const char *user_sid,
 static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
                                                 struct sss_idmap_ctx *idmap_ctx,
                                                 const char *user_sid,
+                                                struct dom_sid *host_sid,
                                                 const char **group_sids,
                                                 int group_size)
 {
@@ -719,8 +728,9 @@ static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
         return AD_GPO_ACE_NEUTRAL;
     }
 
-    ret = ad_gpo_ace_includes_client_sid(user_sid, group_sids, group_size,
-                                         ace->trustee, idmap_ctx, &included);
+    ret = ad_gpo_ace_includes_client_sid(user_sid, host_sid, group_sids,
+                                         group_size, ace->trustee, idmap_ctx,
+                                         &included);
 
     if (ret != EOK) {
         return AD_GPO_ACE_DENIED;
@@ -764,6 +774,7 @@ static enum ace_eval_status ad_gpo_evaluate_ace(struct security_ace *ace,
 static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
                                     struct sss_idmap_ctx *idmap_ctx,
                                     const char *user_sid,
+                                    struct dom_sid *host_sid,
                                     const char **group_sids,
                                     int group_size,
                                     bool *_dacl_access_allowed)
@@ -788,7 +799,7 @@ static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
     for (i = 0; i < dacl->num_aces; i ++) {
         ace = &dacl->aces[i];
 
-        ace_status = ad_gpo_evaluate_ace(ace, idmap_ctx, user_sid,
+        ace_status = ad_gpo_evaluate_ace(ace, idmap_ctx, user_sid, host_sid,
                                          group_sids, group_size);
 
         switch (ace_status) {
@@ -807,6 +818,206 @@ static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
     return EOK;
 }
 
+struct ad_gpo_access_state {
+    struct tevent_context *ev;
+    struct ldb_context *ldb_ctx;
+    struct ad_access_ctx *access_ctx;
+    enum gpo_access_control_mode gpo_mode;
+    enum gpo_map_type gpo_map_type;
+    struct sdap_id_conn_ctx *conn;
+    struct sdap_id_op *sdap_op;
+    char *server_hostname;
+    struct sdap_options *opts;
+    int timeout;
+    struct sss_domain_info *user_domain;
+    struct sss_domain_info *host_domain;
+    const char *user;
+    int gpo_timeout_option;
+    const char *ad_hostname;
+    const char *target_dn;
+    struct gp_gpo **dacl_filtered_gpos;
+    int num_dacl_filtered_gpos;
+    struct gp_gpo **cse_filtered_gpos;
+    int num_cse_filtered_gpos;
+    int cse_gpo_index;
+};
+
+struct ad_gpo_get_host_sid_state {
+    struct tevent_context *ev;
+    struct sss_domain_info *domain;
+    struct sdap_id_conn_ctx *conn;
+    struct sdap_id_op *sdap_op;
+    struct sdap_options *opts;
+    struct sss_domain_info *host_domain;
+    const char *ad_hostname;
+    int timeout;
+};
+
+struct ad_gpo_get_host_sid_callback_data {
+    struct dom_sid host_sid;
+};
+
+struct tevent_req *
+ad_gpo_get_host_sid_send(TALLOC_CTX *mem_ctx,
+                         struct ad_gpo_access_state *access_state)
+{
+    struct tevent_req *req;
+    struct ad_gpo_get_host_sid_state *state;
+
+    req = tevent_req_create(mem_ctx, &state, struct ad_gpo_get_host_sid_state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_req_create() failed\n");
+        return NULL;
+    }
+
+    state->ev = access_state->ev;
+    state->domain = access_state->user_domain;
+    state->conn = access_state->conn;
+    state->sdap_op = access_state->sdap_op;
+    state->opts = access_state->opts;
+    state->host_domain = access_state->host_domain;
+    state->timeout = access_state->timeout;
+    state->ad_hostname = access_state->ad_hostname;
+
+    return req;
+}
+
+enum ndr_err_code
+ndr_pull_dom_sid(struct ndr_pull *ndr,
+                 int ndr_flags,
+                 struct dom_sid *r);
+
+static void
+ad_gpo_get_host_sid_retrieval_done(struct tevent_req *subreq)
+{
+    struct ad_gpo_get_host_sid_state *state;
+    struct ad_gpo_get_host_sid_callback_data *data;
+    int ret;
+    size_t reply_count;
+    struct sysdb_attrs **reply;
+    struct ldb_message_element *el = NULL;
+    enum ndr_err_code ndr_err;
+
+    state = tevent_req_data(subreq, struct ad_gpo_get_host_sid_state);
+    data = tevent_req_callback_data(subreq, struct ad_gpo_get_host_sid_callback_data);
+    ret = sdap_get_generic_recv(subreq, state,
+                                &reply_count, &reply);
+
+    /* reply[0] holds the requested attribute */
+    ret = sysdb_attrs_get_el(reply[0], AD_AT_SID, &el);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sysdb_attrs_get_el failed: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto done;
+    }
+    if (el->num_values != 1) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "ad_gpo_get_host_sid_retrieval_done failed: sid not present\n");
+        ret = EIO;
+        goto done;
+    }
+
+    /* parse the dom_sid from the ldb blob */
+    ndr_err = ndr_pull_struct_blob_all(&(el->values[0]),
+                                       subreq, &(data->host_sid),
+                                       (ndr_pull_flags_fn_t)ndr_pull_dom_sid);
+    if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "ndr_pull_struct_blob_all failed: [%d]\n",
+              ndr_err);
+        ret = EIO;
+        goto done;
+    }
+
+done:
+    if (ret == EOK) {
+        tevent_req_done(subreq);
+    } else {
+        tevent_req_error(subreq, ret);
+    }
+}
+
+static void
+ad_gpo_get_host_sid_done(struct tevent_req *req)
+{
+    struct ad_gpo_get_host_sid_state *state;
+    struct ad_gpo_get_host_sid_callback_data *data;
+    struct tevent_req *subreq;
+    int ret;
+    char *filter = NULL;
+    char *domain_dn;
+    const char *attrs[] = {AD_AT_SID, NULL};
+
+    state = tevent_req_data(req, struct ad_gpo_get_host_sid_state);
+    data = tevent_req_callback_data(req, struct ad_gpo_get_host_sid_callback_data);
+
+    /* Convert the domain name into domain DN */
+    ret = domain_to_basedn(state, state->host_domain->name, &domain_dn);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Cannot convert domain name [%s] to base DN [%d]: %s\n",
+               state->host_domain->name, ret, sss_strerror(ret));
+        goto done;
+    }
+
+    filter = talloc_asprintf(req,
+                             "(&(objectCategory=computer)(name=%s))",
+                             state->ad_hostname);
+    if (!filter) {
+        ret = ENOMEM;
+        goto done;
+    }
+
+    subreq = sdap_get_generic_send(state, state->ev, state->opts,
+                                   sdap_id_op_handle(state->sdap_op),
+                                   domain_dn, LDAP_SCOPE_SUBTREE,
+                                   filter, attrs, NULL, 0,
+                                   state->timeout,
+                                   false);
+
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE, "sdap_get_generic_send failed.\n");
+        ret = EIO;
+        goto done;
+    }
+
+    tevent_req_set_callback(subreq, ad_gpo_get_host_sid_retrieval_done, data);
+
+done:
+    if (ret == EOK) {
+        tevent_req_done(req);
+    } else {
+        tevent_req_error(req, ret);
+    }
+}
+
+static errno_t
+ad_gpo_get_host_sid(TALLOC_CTX *mem_ctx,
+                    struct ad_gpo_access_state *state,
+                    struct dom_sid **host_sid)
+{
+    struct tevent_req *req;
+    struct ad_gpo_get_host_sid_callback_data data;
+
+    req = ad_gpo_get_host_sid_send(mem_ctx, state);
+    if (req == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "ad_gpo_get_host_sid_send() failed\n");
+        return EIO;
+    }
+
+    tevent_req_set_callback(req, ad_gpo_get_host_sid_done, &data);
+
+    *host_sid = talloc_size(mem_ctx, sizeof(struct dom_sid));
+    if (*host_sid) {
+        memcpy(*host_sid, &data.host_sid, sizeof(struct dom_sid));
+    } else {
+        return ENOMEM;
+    }
+
+    return EOK;
+}
+
 /*
  * This function takes candidate_gpos as input, filters out any gpo that is
  * not applicable to the policy target and assigns the result to the
@@ -815,13 +1026,9 @@ static errno_t ad_gpo_evaluate_dacl(struct security_acl *dacl,
  */
 static errno_t
 ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
-                           const char *user,
-                           struct sss_domain_info *domain,
-                           struct sss_idmap_ctx *idmap_ctx,
+                           struct ad_gpo_access_state *state,
                            struct gp_gpo **candidate_gpos,
-                           int num_candidate_gpos,
-                           struct gp_gpo ***_dacl_filtered_gpos,
-                           int *_num_dacl_filtered_gpos)
+                           int num_candidate_gpos)
 {
     TALLOC_CTX *tmp_ctx = NULL;
     int i = 0;
@@ -830,6 +1037,7 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
     struct security_descriptor *sd = NULL;
     struct security_acl *dacl = NULL;
     const char *user_sid = NULL;
+    struct dom_sid *host_sid = NULL;
     const char **group_sids = NULL;
     int group_size = 0;
     int gpo_dn_idx = 0;
@@ -842,12 +1050,19 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
         goto done;
     }
 
-    ret = ad_gpo_get_sids(tmp_ctx, user, domain, &user_sid,
+    ret = ad_gpo_get_sids(tmp_ctx, state->user, state->user_domain, &user_sid,
                           &group_sids, &group_size);
     if (ret != EOK) {
         ret = ERR_NO_SIDS;
         DEBUG(SSSDBG_OP_FAILURE,
               "Unable to retrieve SIDs: [%d](%s)\n", ret, sss_strerror(ret));
+        goto done;
+    }
+
+    ret = ad_gpo_get_host_sid(tmp_ctx, state, &host_sid);
+    if (ret != EOK) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "Unable to retrieve host SID: [%d](%s)\n", ret, sss_strerror(ret));
         goto done;
     }
 
@@ -905,8 +1120,8 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
             break;
         }
 
-        ret = ad_gpo_evaluate_dacl(dacl, idmap_ctx, user_sid, group_sids,
-                                   group_size, &access_allowed);
+        ret = ad_gpo_evaluate_dacl(dacl, state->opts->idmap_ctx->map, user_sid,
+                                   host_sid, group_sids, group_size, &access_allowed);
         if (ret != EOK) {
             DEBUG(SSSDBG_MINOR_FAILURE, "Could not determine if GPO is applicable\n");
             continue;
@@ -928,8 +1143,8 @@ ad_gpo_filter_gpos_by_dacl(TALLOC_CTX *mem_ctx,
 
     dacl_filtered_gpos[gpo_dn_idx] = NULL;
 
-    *_dacl_filtered_gpos = talloc_steal(mem_ctx, dacl_filtered_gpos);
-    *_num_dacl_filtered_gpos = gpo_dn_idx;
+    state->dacl_filtered_gpos = talloc_steal(mem_ctx, dacl_filtered_gpos);
+    state->num_dacl_filtered_gpos = gpo_dn_idx;
 
     ret = EOK;
 
@@ -1557,30 +1772,6 @@ ad_gpo_perform_hbac_processing(TALLOC_CTX *mem_ctx,
 
 /* == ad_gpo_access_send/recv implementation ================================*/
 
-struct ad_gpo_access_state {
-    struct tevent_context *ev;
-    struct ldb_context *ldb_ctx;
-    struct ad_access_ctx *access_ctx;
-    enum gpo_access_control_mode gpo_mode;
-    enum gpo_map_type gpo_map_type;
-    struct sdap_id_conn_ctx *conn;
-    struct sdap_id_op *sdap_op;
-    char *server_hostname;
-    struct sdap_options *opts;
-    int timeout;
-    struct sss_domain_info *user_domain;
-    struct sss_domain_info *host_domain;
-    const char *user;
-    int gpo_timeout_option;
-    const char *ad_hostname;
-    const char *target_dn;
-    struct gp_gpo **dacl_filtered_gpos;
-    int num_dacl_filtered_gpos;
-    struct gp_gpo **cse_filtered_gpos;
-    int num_cse_filtered_gpos;
-    int cse_gpo_index;
-};
-
 static void ad_gpo_connect_done(struct tevent_req *subreq);
 static void ad_gpo_target_dn_retrieval_done(struct tevent_req *subreq);
 static void ad_gpo_process_som_done(struct tevent_req *subreq);
@@ -2103,11 +2294,8 @@ ad_gpo_process_gpo_done(struct tevent_req *subreq)
         goto done;
     }
 
-    ret = ad_gpo_filter_gpos_by_dacl(state, state->user, state->user_domain,
-                                     state->opts->idmap_ctx->map,
-                                     candidate_gpos, num_candidate_gpos,
-                                     &state->dacl_filtered_gpos,
-                                     &state->num_dacl_filtered_gpos);
+    ret = ad_gpo_filter_gpos_by_dacl(state, state, candidate_gpos,
+                                     num_candidate_gpos);
     if (ret != EOK) {
         DEBUG(SSSDBG_OP_FAILURE,
               "Unable to filter GPO list by DACL: [%d](%s)\n",
