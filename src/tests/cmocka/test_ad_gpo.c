@@ -267,6 +267,7 @@ void test_populate_gplink_list_malformed(void **state)
  * Test SID-matching logic
  */
 static void test_ad_gpo_ace_includes_client_sid(const char *user_sid,
+                                                const char *host_sid,
                                                 const char **group_sids,
                                                 int group_size,
                                                 struct dom_sid ace_dom_sid,
@@ -277,6 +278,7 @@ static void test_ad_gpo_ace_includes_client_sid(const char *user_sid,
     struct sss_idmap_ctx *idmap_ctx;
     bool includes_client_sid;
     TALLOC_CTX *tmp_ctx;
+    struct dom_sid *host_dom_sid;
 
     tmp_ctx = talloc_new(global_talloc_context);
     assert_non_null(tmp_ctx);
@@ -286,9 +288,13 @@ static void test_ad_gpo_ace_includes_client_sid(const char *user_sid,
                          &idmap_ctx);
     assert_int_equal(err, IDMAP_SUCCESS);
 
-    ret = ad_gpo_ace_includes_client_sid(user_sid, group_sids, group_size,
-                                         ace_dom_sid, idmap_ctx,
+    err = sss_idmap_sid_to_smb_sid(idmap_ctx, host_sid, &host_dom_sid);
+    assert_int_equal(err, IDMAP_SUCCESS);
+
+    ret = ad_gpo_ace_includes_client_sid(user_sid, host_dom_sid, group_sids,
+                                         group_size, ace_dom_sid, idmap_ctx,
                                          &includes_client_sid);
+    talloc_free(host_dom_sid);
     talloc_free(idmap_ctx);
 
     assert_int_equal(ret, EOK);
@@ -305,13 +311,14 @@ void test_ad_gpo_ace_includes_client_sid_true(void **state)
     struct dom_sid ace_dom_sid = {1, 4, {0, 0, 0, 0, 0, 5}, {21, 2, 3, 4}};
 
     const char *user_sid = "S-1-5-21-1175337206-4250576914-2321192831-1103";
+    const char *host_sid = "S-1-5-21-1898687337-2196588786-2775055786-2102";
 
     int group_size = 2;
     const char *group_sids[] = {"S-1-5-21-2-3-4",
                                 "S-1-5-21-2-3-5"};
 
-    test_ad_gpo_ace_includes_client_sid(user_sid, group_sids, group_size,
-                                        ace_dom_sid, true);
+    test_ad_gpo_ace_includes_client_sid(user_sid, host_sid, group_sids,
+                                        group_size, ace_dom_sid, true);
 }
 
 void test_ad_gpo_ace_includes_client_sid_false(void **state)
@@ -320,13 +327,29 @@ void test_ad_gpo_ace_includes_client_sid_false(void **state)
     struct dom_sid ace_dom_sid = {1, 4, {0, 0, 0, 0, 0, 5}, {21, 2, 3, 4}};
 
     const char *user_sid = "S-1-5-21-1175337206-4250576914-2321192831-1103";
+    const char *host_sid = "S-1-5-21-1898687337-2196588786-2775055786-2102";
 
     int group_size = 2;
     const char *group_sids[] = {"S-1-5-21-2-3-5",
                                 "S-1-5-21-2-3-6"};
 
-    test_ad_gpo_ace_includes_client_sid(user_sid, group_sids, group_size,
-                                        ace_dom_sid, false);
+    test_ad_gpo_ace_includes_client_sid(user_sid, host_sid, group_sids,
+                                        group_size, ace_dom_sid, false);
+}
+
+void test_ad_gpo_ace_includes_host_sid_true(void **state)
+{
+    /* ace_dom_sid represents "S-1-5-21-1898687337-2196588786-2775055786-2102" */
+    struct dom_sid ace_dom_sid = {1, 5, {0, 0, 0, 0, 0, 5}, {21, 1898687337, 2196588786, 2775055786, 2102}};
+
+    const char *user_sid = "S-1-5-21-1175337206-4250576914-2321192831-1103";
+    const char *host_sid = "S-1-5-21-1898687337-2196588786-2775055786-2102";
+
+    int group_size = 0;
+    const char *group_sids[] = {};
+
+    test_ad_gpo_ace_includes_client_sid(user_sid, host_sid, group_sids,
+                                        group_size, ace_dom_sid, true);
 }
 
 int main(int argc, const char *argv[])
@@ -362,6 +385,9 @@ int main(int argc, const char *argv[])
                                         ad_gpo_test_setup,
                                         ad_gpo_test_teardown),
         cmocka_unit_test_setup_teardown(test_ad_gpo_ace_includes_client_sid_false,
+                                        ad_gpo_test_setup,
+                                        ad_gpo_test_teardown),
+        cmocka_unit_test_setup_teardown(test_ad_gpo_ace_includes_host_sid_true,
                                         ad_gpo_test_setup,
                                         ad_gpo_test_teardown),
     };
