@@ -746,6 +746,7 @@ dist_noinst_HEADERS = \
     src/db/sysdb_services.h \
     src/db/sysdb_ssh.h \
     src/db/sysdb_domain_resolution_order.h \
+    src/db/sysdb_computer.h \
     src/confdb/confdb.h \
     src/confdb/confdb_private.h \
     src/confdb/confdb_setup.h \
@@ -1010,6 +1011,7 @@ libsss_util_la_SOURCES = \
     src/db/sysdb_gpo.c \
     src/db/sysdb_certmap.c \
     src/db/sysdb_domain_resolution_order.c \
+    src/db/sysdb_computer.c \
     src/monitor/monitor_sbus.c \
     src/providers/dp_auth_util.c \
     src/providers/dp_pam_data_util.c \
