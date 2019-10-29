@@ -851,15 +851,13 @@ struct ad_gpo_get_host_sid_state {
     struct sss_domain_info *host_domain;
     const char *ad_hostname;
     int timeout;
-};
-
-struct ad_gpo_get_host_sid_callback_data {
-    struct dom_sid host_sid;
+    struct dom_sid **host_sid;
 };
 
 struct tevent_req *
 ad_gpo_get_host_sid_send(TALLOC_CTX *mem_ctx,
-                         struct ad_gpo_access_state *access_state)
+                         struct ad_gpo_access_state *access_state,
+                         struct dom_sid **host_sid)
 {
     struct tevent_req *req;
     struct ad_gpo_get_host_sid_state *state;
@@ -878,6 +876,7 @@ ad_gpo_get_host_sid_send(TALLOC_CTX *mem_ctx,
     state->host_domain = access_state->host_domain;
     state->timeout = access_state->timeout;
     state->ad_hostname = access_state->ad_hostname;
+    state->host_sid = host_sid;
 
     return req;
 }
@@ -890,16 +889,17 @@ ndr_pull_dom_sid(struct ndr_pull *ndr,
 static void
 ad_gpo_get_host_sid_retrieval_done(struct tevent_req *subreq)
 {
+    struct tevent_req *req;
     struct ad_gpo_get_host_sid_state *state;
-    struct ad_gpo_get_host_sid_callback_data *data;
     int ret;
     size_t reply_count;
     struct sysdb_attrs **reply;
     struct ldb_message_element *el = NULL;
     enum ndr_err_code ndr_err;
+    struct dom_sid *host_sid = NULL;
 
-    state = tevent_req_data(subreq, struct ad_gpo_get_host_sid_state);
-    data = tevent_req_callback_data(subreq, struct ad_gpo_get_host_sid_callback_data);
+    req = tevent_req_callback_data(subreq, struct tevent_req);
+    state = tevent_req_data(req, struct ad_gpo_get_host_sid_state);
     ret = sdap_get_generic_recv(subreq, state,
                                 &reply_count, &reply);
 
@@ -919,8 +919,13 @@ ad_gpo_get_host_sid_retrieval_done(struct tevent_req *subreq)
     }
 
     /* parse the dom_sid from the ldb blob */
+    host_sid = talloc_size(subreq, sizeof(struct dom_sid));
+    if (host_sid == NULL) {
+        ret = ENOMEM;
+        goto done;
+    }
     ndr_err = ndr_pull_struct_blob_all(&(el->values[0]),
-                                       subreq, &(data->host_sid),
+                                       subreq, host_sid,
                                        (ndr_pull_flags_fn_t)ndr_pull_dom_sid);
     if (!NDR_ERR_CODE_IS_SUCCESS(ndr_err)) {
         DEBUG(SSSDBG_OP_FAILURE,
@@ -929,6 +934,7 @@ ad_gpo_get_host_sid_retrieval_done(struct tevent_req *subreq)
         ret = EIO;
         goto done;
     }
+    *(state->host_sid) = host_sid;
 
 done:
     if (ret == EOK) {
@@ -939,18 +945,30 @@ done:
 }
 
 static void
-ad_gpo_get_host_sid_done(struct tevent_req *req)
+ad_gpo_get_host_sid_done(struct tevent_req *subreq)
 {
     struct ad_gpo_get_host_sid_state *state;
-    struct ad_gpo_get_host_sid_callback_data *data;
-    struct tevent_req *subreq;
+    struct tevent_req *req;
     int ret;
+    int dp_error;
     char *filter = NULL;
     char *domain_dn;
     const char *attrs[] = {AD_AT_SID, NULL};
 
+    req = tevent_req_callback_data(subreq, struct tevent_req);
     state = tevent_req_data(req, struct ad_gpo_get_host_sid_state);
-    data = tevent_req_callback_data(req, struct ad_gpo_get_host_sid_callback_data);
+
+    ret = sdap_id_op_connect_recv(subreq, &dp_error);
+    talloc_zfree(subreq);
+
+    if (ret != EOK) {
+        if (dp_error != DP_ERR_OFFLINE) {
+            DEBUG(SSSDBG_OP_FAILURE,
+                  "Failed to connect to AD server: [%d](%s)\n",
+                  ret, sss_strerror(ret));
+            goto done;
+        }
+    }
 
     /* Convert the domain name into domain DN */
     ret = domain_to_basedn(state, state->host_domain->name, &domain_dn);
@@ -961,7 +979,7 @@ ad_gpo_get_host_sid_done(struct tevent_req *req)
         goto done;
     }
 
-    filter = talloc_asprintf(req,
+    filter = talloc_asprintf(subreq,
                              "(&(objectCategory=computer)(name=%s))",
                              state->ad_hostname);
     if (!filter) {
@@ -982,13 +1000,13 @@ ad_gpo_get_host_sid_done(struct tevent_req *req)
         goto done;
     }
 
-    tevent_req_set_callback(subreq, ad_gpo_get_host_sid_retrieval_done, data);
+    tevent_req_set_callback(subreq, ad_gpo_get_host_sid_retrieval_done, req);
+
+    ret = EOK;
 
 done:
-    if (ret == EOK) {
-        tevent_req_done(req);
-    } else {
-        tevent_req_error(req, ret);
+    if (ret != EOK) {
+        tevent_req_error(subreq, ret);
     }
 }
 
@@ -998,24 +1016,33 @@ ad_gpo_get_host_sid(TALLOC_CTX *mem_ctx,
                     struct dom_sid **host_sid)
 {
     struct tevent_req *req;
-    struct ad_gpo_get_host_sid_callback_data data;
+    struct tevent_req *subreq;
+    int ret = EOK;
 
-    req = ad_gpo_get_host_sid_send(mem_ctx, state);
+    req = ad_gpo_get_host_sid_send(mem_ctx, state, host_sid);
     if (req == NULL) {
         DEBUG(SSSDBG_CRIT_FAILURE, "ad_gpo_get_host_sid_send() failed\n");
-        return EIO;
+        ret = EIO;
+        goto immediately;
     }
 
-    tevent_req_set_callback(req, ad_gpo_get_host_sid_done, &data);
+    subreq = sdap_id_op_connect_send(state->sdap_op, state, &ret);
+    if (subreq == NULL) {
+        DEBUG(SSSDBG_OP_FAILURE,
+              "sdap_id_op_connect_send failed: [%d](%s)\n",
+               ret, sss_strerror(ret));
+        goto immediately;
+    }
+    tevent_req_set_callback(subreq, ad_gpo_get_host_sid_done, req);
+    tevent_loop_wait(subreq);
 
-    *host_sid = talloc_size(mem_ctx, sizeof(struct dom_sid));
-    if (*host_sid) {
-        memcpy(*host_sid, &data.host_sid, sizeof(struct dom_sid));
+immediately:
+    if (ret == EOK) {
+        tevent_req_done(req);
     } else {
-        return ENOMEM;
+        tevent_req_error(req, ret);
     }
-
-    return EOK;
+    return ret;
 }
 
 /*
